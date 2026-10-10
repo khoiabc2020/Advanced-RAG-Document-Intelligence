@@ -1,0 +1,524 @@
+"use client";
+
+import React from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
+import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
+import { oneDark } from "react-syntax-highlighter/dist/esm/styles/prism";
+import { motion } from "framer-motion";
+import { Bot, Check, Copy, RefreshCcw, ThumbsDown, ThumbsUp, User, Scale, FileText, ListTree } from "lucide-react";
+import type { Citation, Message } from "../lib/api";
+import { CitationPreview } from "./CitationPreview";
+import { Meter } from "./ui";
+
+export type MessageFeedbackState = "idle" | "up" | "down" | "pending" | "error";
+
+function getConfidenceRailClass(sources: Citation[] | null | undefined): string {
+  if (!sources || sources.length === 0) return "";
+  const avg = sources.reduce((s, c) => s + c.score, 0) / sources.length;
+  if (avg >= 0.75) return "confidence-high-rail";
+  if (avg >= 0.45) return "confidence-med-rail";
+  return "confidence-low-rail";
+}
+
+function getConfidenceTooltip(sources: Citation[] | null | undefined): string | undefined {
+  if (!sources || sources.length === 0) return undefined;
+  const avg = sources.reduce((s, c) => s + c.score, 0) / sources.length;
+  const pct = Math.round(avg * 100);
+  const tier = avg >= 0.75 ? "Strong" : avg >= 0.45 ? "Medium" : "Weak";
+  return `${tier} grounding · avg retrieval score ${pct}% across ${sources.length} source${sources.length === 1 ? "" : "s"}`;
+}
+
+interface MessageBubbleProps {
+  message: Message;
+  onRerun?: (message: Message) => void;
+  rerunDisabled?: boolean;
+  /** When false but the assistant message is empty, show a placeholder instead of infinite typing dots. */
+  isStreaming?: boolean;
+  /** Called when the user clicks thumbs-up / thumbs-down. Omitting disables the UI. */
+  onFeedback?: (message: Message, rating: "up" | "down") => void;
+  feedbackState?: MessageFeedbackState;
+}
+
+// Match inline citation markers like [1], [ 2 ], or ranges like [1,3,5].
+// We replace them with hoverable superscript chips that reveal the underlying
+// excerpt and page reference.
+const CITATION_RE = /\[(\d+(?:\s*,\s*\d+)*)\]/g;
+
+function renderWithInlineCitations(text: string, sources: Citation[]): React.ReactNode[] {
+  if (!sources?.length || !text) return [text];
+  const nodes: React.ReactNode[] = [];
+  let lastIndex = 0;
+  let match: RegExpExecArray | null;
+  CITATION_RE.lastIndex = 0;
+  while ((match = CITATION_RE.exec(text))) {
+    const start = match.index;
+    if (start > lastIndex) nodes.push(text.slice(lastIndex, start));
+    const indices = match[1]
+      .split(",")
+      .map((part) => Number.parseInt(part.trim(), 10))
+      .filter((n) => Number.isFinite(n));
+    nodes.push(
+      <CitationPills key={`cite-${start}`} indices={indices} sources={sources} />
+    );
+    lastIndex = start + match[0].length;
+  }
+  if (lastIndex < text.length) nodes.push(text.slice(lastIndex, text.length));
+  return nodes;
+}
+
+function rewriteCitations(children: React.ReactNode, sources: Citation[]): React.ReactNode {
+  if (!sources?.length) return children;
+  return React.Children.map(children, (child) => {
+    if (typeof child === "string") {
+      return renderWithInlineCitations(child, sources);
+    }
+    return child;
+  });
+}
+
+function CitationPills({
+  indices,
+  sources,
+}: {
+  indices: number[];
+  sources: Citation[];
+}) {
+  return (
+    <>
+      {indices.map((raw, idx) => {
+        // Accept both 1-indexed ([1] == sources[0]) and 0-indexed callers.
+        const oneIdx = raw - 1;
+        const source = sources[oneIdx] ?? sources[raw] ?? null;
+        const label = raw;
+        if (!source) {
+          return (
+            <span
+              key={`${label}-${idx}`}
+              className="data-num inline-flex items-center mx-[2px] px-1 text-[10px] leading-none"
+              style={{
+                borderRadius: "var(--radius-xs)",
+                color: "var(--text-muted)",
+                border: "1px solid var(--border)",
+                verticalAlign: "super",
+                lineHeight: 1.4,
+              }}
+            >
+              [{label}]
+            </span>
+          );
+        }
+        return (
+          <CitationPreview key={`${label}-${idx}`} citation={source}>
+            <span
+              tabIndex={0}
+              aria-label={`Source ${label}${source.page_number ? `, page ${source.page_number}` : ""}`}
+              className="data-num inline-flex items-center mx-[2px] px-1 text-[10px] leading-none transition-colors focus-ring"
+              style={{
+                borderRadius: "var(--radius-xs)",
+                background: "var(--accent-primary-soft)",
+                color: "var(--accent-primary)",
+                border: "1px solid var(--accent-primary-soft)",
+                cursor: "help",
+                verticalAlign: "super",
+                lineHeight: 1.4,
+              }}
+            >
+              [{label}]
+            </span>
+          </CitationPreview>
+        );
+      })}
+    </>
+  );
+}
+
+/**
+ * Compact provenance summary rendered above the answer when the assistant
+ * message carries retrieved sources: count, score range (mono data-num),
+ * and a compact confidence meter of the average retrieval score.
+ */
+function ProvenanceSummary({ sources }: { sources: Citation[] }) {
+  const scores = sources.map((s) => s.score).filter((n) => Number.isFinite(n));
+  if (!scores.length) return null;
+  const lo = Math.min(...scores);
+  const hi = Math.max(...scores);
+  const avg = scores.reduce((sum, n) => sum + n, 0) / scores.length;
+  return (
+    <div
+      className="flex items-center gap-2.5 flex-wrap mb-2.5 pb-2"
+      style={{ borderBottom: "1px solid var(--border)" }}
+    >
+      <span
+        className="text-[10px] uppercase tracking-widest"
+        style={{ color: "var(--text-tertiary)" }}
+      >
+        Evidence
+      </span>
+      <span className="data-num text-[11px]" style={{ color: "var(--text-secondary)" }}>
+        {sources.length} {sources.length === 1 ? "source" : "sources"} · {lo.toFixed(2)}–{hi.toFixed(2)}
+      </span>
+      <Meter value={avg} compact label="avg" showValue />
+    </div>
+  );
+}
+
+// Streaming optimization:
+// Wrapped MessageBubble in React.memo to prevent expensive ReactMarkdown and
+// SyntaxHighlighter re-renders for all previous messages in the chat history
+// during rapid state updates from token streaming.
+const MessageBubble = React.memo(function MessageBubble({
+  message,
+  onRerun,
+  rerunDisabled = false,
+  isStreaming = false,
+  onFeedback,
+  feedbackState = "idle",
+}: MessageBubbleProps) {
+  const isUser = message.role === "user";
+  const canShowFeedback =
+    !isUser && !isStreaming && Boolean(onFeedback) && Boolean(message.content);
+  const feedbackPending = feedbackState === "pending";
+  const feedbackRecorded = feedbackState === "up" || feedbackState === "down";
+
+  const mode = message.mode;
+  const modeBadge = !isUser && mode && mode !== "ask" ? (
+    <span
+      className="inline-flex items-center gap-1 text-[10px] font-semibold uppercase tracking-widest px-1.5 py-0.5 rounded-sm mb-1.5"
+      style={{
+        background:
+          mode === "compare"
+            ? "var(--warning-soft)"
+            : mode === "extract"
+              ? "var(--success-soft)"
+              : "var(--accent-secondary-soft)",
+        color:
+          mode === "compare"
+            ? "var(--warning)"
+            : mode === "extract"
+              ? "var(--success)"
+              : "var(--accent-secondary)",
+        border: "1px solid var(--border)",
+      }}
+    >
+      {mode === "compare" && <Scale size={10} />}
+      {mode === "extract" && <FileText size={10} />}
+      {mode === "brief" && <ListTree size={10} />}
+      {mode}
+    </span>
+  ) : null;
+
+  const isBrief = !isUser && mode === "brief";
+
+  return (
+    <div
+      className="flex gap-3"
+      style={{ justifyContent: isUser ? "flex-end" : "flex-start", maxWidth: "100%" }}
+    >
+      {!isUser ? (
+        <div className="flex-shrink-0 flex items-start pt-0.5">
+          <div
+            className="flex items-center justify-center"
+            style={{
+              width: 28,
+              height: 28,
+              borderRadius: "var(--radius-md)",
+              background: "var(--bg-surface)",
+              border: "1px solid var(--border)",
+            }}
+          >
+            <Bot size={14} style={{ color: "var(--accent-primary)" }} />
+          </div>
+        </div>
+      ) : null}
+
+      <div
+        className={`${
+          !isUser && message.sources?.length && !isStreaming
+            ? getConfidenceRailClass(message.sources)
+            : ""
+        }`}
+        title={!isUser && !isStreaming ? getConfidenceTooltip(message.sources) : undefined}
+        style={{
+          maxWidth: isUser ? "75%" : "85%",
+          // User turns are compact hairline surface cards; assistant turns sit
+          // borderless on the canvas with only the confidence rail as edge.
+          // NOTE: no inline `border` on assistant turns — an inline shorthand
+          // would override the confidence-rail class's border-left.
+          background: isUser ? "var(--bg-surface)" : "transparent",
+          border: isUser ? "1px solid var(--border)" : undefined,
+          borderRadius: isUser ? "var(--radius-lg)" : "var(--radius-xs)",
+          padding: isUser ? "10px 14px" : "4px 6px 4px 12px",
+          color: "var(--text-primary)",
+        }}
+      >
+        {isUser ? (
+          <div className="flex flex-col gap-2">
+            <p className="text-sm leading-relaxed whitespace-pre-wrap">{message.content}</p>
+            {onRerun ? (
+              <div className="flex justify-end">
+                <motion.button
+                  type="button"
+                  onClick={() => onRerun(message)}
+                  disabled={rerunDisabled}
+                  aria-label="Rerun this message"
+                  title="Rerun this message"
+                  className="inline-flex items-center gap-1 rounded-sm px-2 py-1 text-[11px] transition-colors"
+                  style={{
+                    background: "transparent",
+                    color: "var(--text-tertiary)",
+                    borderWidth: "1px",
+                    borderStyle: "solid",
+                    borderColor: "var(--border)",
+                    opacity: rerunDisabled ? 0.55 : 1,
+                  }}
+                  whileHover={{ borderColor: "var(--border-hover)", color: "var(--text-secondary)" }}
+                  whileTap={{ scale: 0.92 }}
+                >
+                  <RefreshCcw size={10} />
+                  Rerun
+                </motion.button>
+              </div>
+            ) : null}
+          </div>
+        ) : (
+          <div
+            className="markdown-body"
+            style={isBrief ? { borderLeft: "2px solid var(--accent-secondary)", paddingLeft: 12, marginLeft: -4 } : undefined}
+          >
+            {modeBadge}
+            {message.sources?.length ? <ProvenanceSummary sources={message.sources} /> : null}
+            {!message.content ? (
+              isStreaming ? (
+                <TypingIndicator />
+              ) : (
+                <p className="text-sm leading-relaxed" style={{ color: "var(--text-muted)" }}>
+                  No response received.
+                </p>
+              )
+            ) : (
+              <ReactMarkdown
+                remarkPlugins={[remarkGfm]}
+                components={{
+                  code({ className, children, ...props }) {
+                    const match = /language-(\w+)/.exec(className || "");
+                    const code = String(children).replace(/\n$/, "");
+                    if (match) {
+                      return <CodeBlock language={match[1]} code={code} />;
+                    }
+                    return (
+                      <code className={className} {...props}>
+                        {children}
+                      </code>
+                    );
+                  },
+                  // Rewrite plain text nodes so `[n]` markers become
+                  // hoverable citation pills that link to the retrieved
+                  // source. Preserves markdown formatting around them.
+                  p({ children, ...props }) {
+                    return (
+                      <p {...props}>
+                        {rewriteCitations(children, message.sources ?? [])}
+                      </p>
+                    );
+                  },
+                  li({ children, ...props }) {
+                    return (
+                      <li {...props}>
+                        {rewriteCitations(children, message.sources ?? [])}
+                      </li>
+                    );
+                  },
+                }}
+              >
+                {message.content}
+              </ReactMarkdown>
+            )}
+            {canShowFeedback ? (
+              <FeedbackControls
+                message={message}
+                state={feedbackState}
+                pending={feedbackPending}
+                recorded={feedbackRecorded}
+                onFeedback={onFeedback!}
+              />
+            ) : null}
+          </div>
+        )}
+      </div>
+
+      {isUser ? (
+        <div className="flex-shrink-0 flex items-start pt-0.5">
+          <div
+            className="flex items-center justify-center"
+            style={{
+              width: 28,
+              height: 28,
+              borderRadius: "var(--radius-md)",
+              background: "var(--bg-secondary)",
+              border: "1px solid var(--border)",
+            }}
+          >
+            <User size={14} style={{ color: "var(--text-tertiary)" }} />
+          </div>
+        </div>
+      ) : null}
+    </div>
+  );
+});
+export default MessageBubble;
+
+function CodeBlock({ language, code }: { language: string; code: string }) {
+  const [copied, setCopied] = React.useState(false);
+
+  const handleCopy = async () => {
+    try {
+      await navigator.clipboard.writeText(code);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 2000);
+    } catch {
+      setCopied(false);
+    }
+  };
+
+  return (
+    <div className="relative group" style={{ margin: "0.75rem 0" }}>
+      <div
+        className="flex items-center justify-between px-3 py-1.5"
+        style={{
+          background: "var(--bg-secondary)",
+          borderBottom: "1px solid var(--border)",
+          borderTopLeftRadius: "var(--radius-md)",
+          borderTopRightRadius: "var(--radius-md)",
+        }}
+      >
+        <span
+          className="data-num uppercase"
+          style={{ fontSize: 10, letterSpacing: "0.08em", color: "var(--text-tertiary)" }}
+        >
+          {language}
+        </span>
+        {/* [a11y] Added aria-label — icon-only button needs accessible name */}
+        <motion.button
+          type="button"
+          onClick={handleCopy}
+          className="flex items-center gap-1 rounded-sm px-1.5 py-0.5 text-[10px] font-medium transition-colors focus-ring"
+          style={{
+            color: copied ? "var(--success)" : "var(--text-muted)",
+            background: "transparent",
+            border: "1px solid var(--border)",
+          }}
+          aria-label={copied ? "Code copied" : "Copy code to clipboard"}
+          title={copied ? "Code copied" : "Copy code to clipboard"}
+          whileTap={{ scale: 0.9 }}
+        >
+          {copied ? <Check size={10} /> : <Copy size={10} />}
+          {copied ? "Copied" : "Copy"}
+        </motion.button>
+      </div>
+      <SyntaxHighlighter
+        language={language}
+        style={oneDark}
+        customStyle={{
+          margin: 0,
+          borderRadius: "0 0 var(--radius-md) var(--radius-md)",
+          background: "var(--bg-primary)",
+          fontSize: "0.8125rem",
+          border: "1px solid var(--border)",
+          borderTop: "none",
+        }}
+      >
+        {code}
+      </SyntaxHighlighter>
+    </div>
+  );
+}
+function FeedbackControls({
+  message,
+  state,
+  pending,
+  recorded,
+  onFeedback,
+}: {
+  message: Message;
+  state: MessageFeedbackState;
+  pending: boolean;
+  recorded: boolean;
+  onFeedback: (message: Message, rating: "up" | "down") => void;
+}) {
+  const up = state === "up";
+  const down = state === "down";
+  const label = pending
+    ? "Saving feedback…"
+    : up
+    ? "Thanks — recorded."
+    : down
+    ? "Thanks — recorded."
+    : state === "error"
+    ? "Couldn't save feedback."
+    : null;
+  return (
+    <div
+      className="flex items-center gap-2 pt-3 mt-3"
+      style={{
+        borderTop: "1px solid var(--border)",
+        color: "var(--text-muted)",
+      }}
+    >
+      <span className="text-[11px]">Was this helpful?</span>
+      <motion.button
+        type="button"
+        aria-label="Thumbs up"
+        title="Thumbs up"
+        disabled={pending || recorded}
+        onClick={() => onFeedback(message, "up")}
+        whileTap={{ scale: 0.9 }}
+        className="inline-flex items-center gap-1 rounded-sm px-2 py-1 text-[11px] transition-colors"
+        style={{
+          background: up ? "var(--success-soft)" : "transparent",
+          color: up ? "var(--success)" : "var(--text-muted)",
+          border: "1px solid var(--border)",
+          cursor: pending || recorded ? "default" : "pointer",
+          opacity: pending ? 0.6 : 1,
+        }}
+      >
+        <ThumbsUp size={11} />
+      </motion.button>
+      <motion.button
+        type="button"
+        aria-label="Thumbs down"
+        title="Thumbs down"
+        disabled={pending || recorded}
+        onClick={() => onFeedback(message, "down")}
+        whileTap={{ scale: 0.9 }}
+        className="inline-flex items-center gap-1 rounded-sm px-2 py-1 text-[11px] transition-colors"
+        style={{
+          background: down ? "var(--error-soft)" : "transparent",
+          color: down ? "var(--error)" : "var(--text-muted)",
+          border: "1px solid var(--border)",
+          cursor: pending || recorded ? "default" : "pointer",
+          opacity: pending ? 0.6 : 1,
+        }}
+      >
+        <ThumbsDown size={11} />
+      </motion.button>
+      {label ? <span className="text-[11px]">{label}</span> : null}
+    </div>
+  );
+}
+
+function TypingIndicator() {
+  return (
+    <div className="flex gap-1.5 items-center py-1">
+      {[0, 0.15, 0.3].map((delay, i) => (
+        <motion.div
+          key={i}
+          className="w-1.5 h-1.5 rounded-full"
+          style={{ background: "var(--accent-secondary)" }}
+          animate={{ opacity: [0.3, 1, 0.3], scale: [0.8, 1.1, 0.8] }}
+          transition={{ duration: 1, repeat: Infinity, delay, ease: "easeInOut" }}
+        />
+      ))}
+    </div>
+  );
+}

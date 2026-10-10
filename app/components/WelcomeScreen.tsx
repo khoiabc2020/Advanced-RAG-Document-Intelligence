@@ -1,0 +1,188 @@
+"use client";
+
+import React, { useState } from "react";
+import { motion } from "framer-motion";
+import { ArrowRight } from "lucide-react";
+import { type AuthUser, type Provider } from "../lib/api";
+import { staggerContainer, staggerItem } from "../lib/motion";
+import { useStore, DEFAULT_CHAT, DEFAULT_EMBEDDING } from "../lib/store";
+import AuthForm from "./AuthForm";
+import { Button, TextField } from "./ui";
+
+interface WelcomeScreenProps {
+  onComplete: () => void;
+}
+
+/**
+ * Render the initial Quick Setup console to choose an LLM provider, enter an
+ * API key, optionally sign in, and complete initial app setup.
+ *
+ * @param onComplete - Callback invoked after settings are saved and setup is marked complete
+ * @returns The welcome/setup screen as a JSX element
+ */
+export default function WelcomeScreen({ onComplete }: WelcomeScreenProps) {
+  const { dispatch } = useStore();
+  const [provider, setProvider] = useState<Provider>("openai");
+  const [apiKey, setApiKey] = useState("");
+  const [showLogin, setShowLogin] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const handleSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!apiKey.trim()) {
+      setError("Please enter your API key");
+      return;
+    }
+
+    // Validate key format
+    if ((provider === "openai" || provider === "deepseek") && !apiKey.startsWith("sk-")) {
+      setError(`${provider === "openai" ? "OpenAI" : "DeepSeek"} keys should start with 'sk-'`);
+      return;
+    }
+
+    // Save settings
+    dispatch({
+      type: "SET_SETTINGS",
+      payload: {
+        provider,
+        providerApiKey: apiKey.trim(),
+        chatModel: DEFAULT_CHAT[provider],
+        embeddingModel: DEFAULT_EMBEDDING[provider],
+      },
+    });
+
+    dispatch({ type: "SET_SETUP_COMPLETE", payload: true });
+    onComplete();
+  };
+
+  /* Same contract as the old inline LoginPrompt: signing in marks setup complete. */
+  const handleAuthenticated = (user: AuthUser) => {
+    dispatch({ type: "SET_CURRENT_USER", payload: user });
+    dispatch({ type: "SET_SETUP_COMPLETE", payload: true });
+  };
+
+  if (showLogin) {
+    return (
+      <div
+        className="flex min-h-screen items-center justify-center px-4 py-10"
+        style={{ background: "var(--bg-primary)" }}
+      >
+        <div className="w-full max-w-md">
+          <AuthForm
+            compact
+            onSwitchToSetup={() => setShowLogin(false)}
+            onAuthenticated={handleAuthenticated}
+          />
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div
+      className="flex min-h-screen items-center justify-center px-4 py-10"
+      style={{ background: "var(--bg-primary)" }}
+    >
+      <motion.div
+        className="w-full max-w-md rounded-xl p-6 sm:p-7"
+        style={{
+          background: "var(--bg-secondary)",
+          border: "1px solid var(--border)",
+          boxShadow: "var(--shadow-md)",
+        }}
+        variants={staggerContainer}
+        initial="hidden"
+        animate="show"
+      >
+        <motion.p
+          variants={staggerItem}
+          className="text-[10px] font-semibold uppercase tracking-widest"
+          style={{ color: "var(--text-muted)" }}
+        >
+          Quick setup
+        </motion.p>
+        <motion.h1
+          variants={staggerItem}
+          className="display mt-3 text-2xl font-semibold"
+          style={{ color: "var(--text-primary)" }}
+        >
+          Connect a provider
+        </motion.h1>
+        <motion.p
+          variants={staggerItem}
+          className="mt-2 text-sm leading-relaxed"
+          style={{ color: "var(--text-secondary)" }}
+        >
+          Bring your own model key to start asking questions across your documents.
+        </motion.p>
+
+        <motion.form
+          variants={staggerItem}
+          onSubmit={handleSubmit}
+          className="mt-6 flex flex-col gap-4"
+        >
+          {/* Provider segmented control */}
+          <div
+            role="group"
+            aria-label="Provider"
+            className="grid grid-cols-3 gap-1 rounded-lg p-1"
+            style={{ background: "var(--bg-surface)", border: "1px solid var(--border)" }}
+          >
+            {(["openai", "gemini", "deepseek"] as const).map((p) => {
+              const active = provider === p;
+              return (
+                <button
+                  key={p}
+                  type="button"
+                  onClick={() => setProvider(p)}
+                  aria-pressed={active}
+                  className="rounded-md px-4 py-2 text-[13px] font-medium transition-colors focus-ring"
+                  style={{
+                    background: active ? "var(--bg-elevated)" : "transparent",
+                    color: active ? "var(--text-primary)" : "var(--text-secondary)",
+                    border: `1px solid ${active ? "var(--border-hover)" : "transparent"}`,
+                  }}
+                >
+                  {p === "openai" ? "OpenAI" : p === "deepseek" ? "DeepSeek" : "Gemini"}
+                </button>
+              );
+            })}
+          </div>
+
+          {/* API key */}
+          <TextField
+            label={provider === "openai" ? "OpenAI API key" : provider === "deepseek" ? "DeepSeek API key" : "Google AI API key"}
+            hint="Stored in this browser session and sent as a request header to your self-hosted API on each call."
+            error={error}
+            mono
+            type="password"
+            value={apiKey}
+            onChange={(e) => {
+              setApiKey(e.target.value);
+              setError(null);
+            }}
+            placeholder={provider === "openai" || provider === "deepseek" ? "sk-..." : "Google AI API key"}
+            autoComplete="off"
+          />
+
+          <Button type="submit" variant="primary" size="lg" className="w-full">
+            Get Started
+            <ArrowRight size={15} />
+          </Button>
+        </motion.form>
+
+        <motion.div variants={staggerItem} className="mt-4">
+          <Button
+            type="button"
+            variant="ghost"
+            size="lg"
+            className="w-full"
+            onClick={() => setShowLogin(true)}
+          >
+            Sign in instead
+          </Button>
+        </motion.div>
+      </motion.div>
+    </div>
+  );
+}

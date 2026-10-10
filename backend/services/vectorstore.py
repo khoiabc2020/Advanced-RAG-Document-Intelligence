@@ -1,0 +1,341 @@
+"""Vector persistence and retrieval for PostgreSQL + pgvector and SQLite fallback."""
+
+from __future__ import annotations
+
+import asyncio
+from dataclasses import dataclass
+
+from pydantic import TypeAdapter
+from backend.database import execute, execute_many, fetch_all
+from backend.services.chunking import ChunkPayload
+from backend.settings import settings
+
+try:
+    import orjson
+except ModuleNotFoundError:  # pragma: no cover - optional dependency
+    orjson = None
+
+# ⚡ BOLT OPTIMIZATION:
+# Pre-compile the TypeAdapter for list[float] to avoid runtime overhead.
+# This uses Pydantic's underlying Rust-based JSON parser directly via dump_json(),
+# skipping the standard library's json.dumps() when orjson is not available.
+_embedding_adapter = TypeAdapter(list[float])
+
+@dataclass(slots=True)
+class RetrievedChunk:
+    chunk_id: str
+    document_id: str
+    excerpt: str
+    score: float
+    page_number: int | None = None
+    chunk_type: str = "text"
+    metadata_json: str | None = None
+    chunk_index: int | None = None
+
+
+
+def _vector_literal(embedding: list[float]) -> str:
+    return "[" + ",".join(f"{value:.10f}" for value in embedding) + "]"
+
+
+async def replace_chunks(
+    document_id: str,
+    owner_id: str,
+    chunks: list[ChunkPayload],
+    embeddings: list[list[float]],
+) -> None:
+    await execute("DELETE FROM document_chunks WHERE document_id = ? AND owner_id = ?", (document_id, owner_id))
+
+    if not chunks:
+        return
+
+    if settings.using_postgres:
+        params_list = [
+            (
+                f"{document_id}:{chunk.chunk_index}",
+                document_id,
+                owner_id,
+                chunk.chunk_index,
+                chunk.content.replace("\x00", "") if isinstance(chunk.content, str) else chunk.content,
+                chunk.page_number,
+                chunk.parent_content.replace("\x00", "") if isinstance(chunk.parent_content, str) else chunk.parent_content,
+                chunk.chunk_type,
+                chunk.metadata_json,
+                _vector_literal(embedding),
+            )
+            for chunk, embedding in zip(chunks, embeddings, strict=True)
+        ]
+        await execute_many(
+            """
+            INSERT INTO document_chunks
+                (id, document_id, owner_id, chunk_index, content, page_number, parent_content, chunk_type, metadata_json, embedding)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?::vector)
+            """,
+            params_list,
+        )
+    else:
+        params_list = [
+            (
+                f"{document_id}:{chunk.chunk_index}",
+                document_id,
+                owner_id,
+                chunk.chunk_index,
+                chunk.content,
+                chunk.page_number,
+                chunk.parent_content,
+                chunk.chunk_type,
+                chunk.metadata_json,
+                orjson.dumps(embedding).decode("utf-8") if orjson is not None else _embedding_adapter.dump_json(embedding).decode("utf-8"),
+            )
+            for chunk, embedding in zip(chunks, embeddings, strict=True)
+        ]
+        await execute_many(
+            """
+            INSERT INTO document_chunks
+                (id, document_id, owner_id, chunk_index, content, page_number, parent_content, chunk_type, metadata_json, embedding_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            params_list,
+        )
+
+
+async def preview_chunks(document_id: str, owner_id: str, limit: int = 8) -> list[dict]:
+    return await fetch_all(
+        """
+        SELECT id AS chunk_id, document_id, content, page_number, chunk_index
+        FROM document_chunks
+        WHERE document_id = ? AND owner_id = ?
+        ORDER BY chunk_index ASC
+        LIMIT ?
+        """,
+        (document_id, owner_id, limit),
+    )
+
+
+def _load_embedding_json(payload: str) -> list[float]:
+    """
+    Parse a JSON-encoded embedding payload into a list of floats.
+    
+    Parameters:
+    	payload (str | bytes): JSON text or UTF-8 bytes containing an array of numeric embedding values.
+    
+    Returns:
+    	embedding (list[float]): The decoded embedding vector.
+    """
+    if orjson is not None:
+        if isinstance(payload, str):
+            payload = payload.encode("utf-8")
+        return orjson.loads(payload)
+    # ⚡ BOLT OPTIMIZATION:
+    # Use Pydantic's Rust-based core parser directly for high-performance deserialization
+    # when orjson is not available. This avoids Python's standard library json.loads() overhead
+    # and provides an order of magnitude faster parsing for large float arrays.
+    return _embedding_adapter.validate_json(payload)
+
+
+def _excerpt_from_row(row: dict) -> str:
+    """Prefer parent_content when parent-doc retrieval is enabled."""
+    if settings.retrieval_parent_doc_enabled:
+        parent = row.get("parent_content") if hasattr(row, "get") else None
+        if parent is None:
+            try:
+                parent = row["parent_content"]
+            except (KeyError, IndexError):
+                parent = None
+        if parent:
+            return parent
+    return row["content"]
+
+
+def _compute_similarities_sqlite(rows: list[dict], query_embedding: list[float], top_k: int, min_score: float = 0.0) -> list[RetrievedChunk]:
+
+    """
+    Compute cosine similarity between a query embedding and a set of stored embeddings (SQLite fallback) and return the top-matching chunks.
+    
+    Parses each row's JSON-encoded embedding, normalizes vectors, computes cosine similarity with the query, and returns up to `top_k` RetrievedChunk entries whose similarity is greater than or equal to `min_score`, ordered by descending similarity.
+    
+    Parameters:
+        rows (list[dict]): Rows containing at least `id`, `document_id`, `content`, and `embedding_json`; may include `page_number`.
+        query_embedding (list[float]): Embedding vector for the query.
+        top_k (int): Maximum number of results to return.
+        min_score (float, optional): Minimum similarity score (inclusive) required for a result to be included. Defaults to 0.0.
+    
+    Returns:
+        list[RetrievedChunk]: Retrieved chunks sorted by descending similarity. Each item's `score` is the cosine similarity between the stored embedding and `query_embedding`.
+    
+    Raises:
+        ValueError: If NumPy is not available (required for similarity computation).
+    """
+    try:
+        import numpy as np
+    except ImportError as exc:
+        raise ValueError("numpy is required for SQLite vector similarity search.") from exc
+
+
+    matrix = np.asarray([_load_embedding_json(row["embedding_json"]) for row in rows], dtype=np.float32)
+    query = np.asarray(query_embedding, dtype=np.float32)
+    query = query / (np.linalg.norm(query) + 1e-9)
+    matrix = matrix / (np.linalg.norm(matrix, axis=1, keepdims=True) + 1e-9)
+    scores = matrix @ query
+    indices = np.argsort(-scores)[:top_k]
+    result: list[RetrievedChunk] = []
+    for index in indices:
+        score = float(scores[int(index)])
+        if score < min_score:
+            continue
+        row = rows[int(index)]
+        result.append(
+            RetrievedChunk(
+                chunk_id=row["id"],
+                document_id=row["document_id"],
+                excerpt=_excerpt_from_row(row),
+                score=score,
+                page_number=row.get("page_number"),
+            )
+        )
+    return result
+
+
+async def query_similar(
+    document_id: str,
+    owner_id: str,
+    query_embedding: list[float],
+    top_k: int,
+    min_score: float = 0.0,
+    workspace_id: str | None = None,
+) -> list[RetrievedChunk]:
+    """
+    Retrieve the most similar chunks for a single document using the provided query embedding.
+    
+    Parameters:
+        document_id (str): ID of the document to search within.
+        owner_id (str): ID of the owner/namespace for the document.
+        query_embedding (list[float]): Embedding vector representing the query.
+        top_k (int): Maximum number of results to return.
+        min_score (float): Minimum similarity score required for a result to be included.
+        workspace_id (str | None): Optional workspace ID to allow workspace-scoped access.
+    
+    Returns:
+        list[RetrievedChunk]: Retrieved chunks meeting `min_score`, sorted by similarity descending and limited to `top_k`.
+    """
+    ws_id = workspace_id or ""
+    if settings.using_postgres:
+        rows = await fetch_all(
+            """
+            SELECT c.id, c.document_id, c.content, c.page_number, c.parent_content, c.chunk_index,
+                   1 - (c.embedding <=> ?::vector) AS score
+            FROM document_chunks c
+            JOIN documents d ON c.document_id = d.id
+            WHERE c.document_id = ? AND (c.owner_id = ? OR d.workspace_id = ?)
+            ORDER BY c.embedding <=> ?::vector
+            LIMIT ?
+            """,
+            (_vector_literal(query_embedding), document_id, owner_id, ws_id, _vector_literal(query_embedding), top_k),
+        )
+        return [
+            RetrievedChunk(
+                chunk_id=row["id"],
+                document_id=row["document_id"],
+                excerpt=_excerpt_from_row(row),
+                score=float(row["score"] or 0.0),
+                page_number=row.get("page_number"),
+                chunk_index=row.get("chunk_index"),
+            )
+            for row in rows
+            if float(row["score"] or 0.0) >= min_score
+        ]
+
+    rows = await fetch_all(
+        """
+        SELECT c.id, c.document_id, c.content, c.page_number, c.parent_content, c.embedding_json
+        FROM document_chunks c
+        JOIN documents d ON c.document_id = d.id
+        WHERE c.document_id = ? AND (c.owner_id = ? OR d.workspace_id = ?)
+        """,
+        (document_id, owner_id, ws_id),
+    )
+    if not rows:
+        return []
+
+    return await asyncio.to_thread(_compute_similarities_sqlite, rows, query_embedding, top_k, min_score)
+
+
+async def query_similar_multi(
+    document_ids: list[str],
+    owner_id: str,
+    query_embedding: list[float],
+    top_k: int,
+    min_score: float = 0.0,
+    workspace_id: str | None = None,
+) -> list[RetrievedChunk]:
+    """
+    Search multiple documents for chunks similar to a query embedding and return the highest-scoring matches.
+    
+    Runs a single batched similarity search across all given document IDs, filtering by `min_score`,
+    sorting by score descending, and returning up to `top_k` results. This avoids the N+1 query problem.
+    
+    Parameters:
+        document_ids (list[str]): Document IDs to search.
+        owner_id (str): Owner ID that scopes the document search.
+        query_embedding (list[float]): Embedding vector representing the query.
+        top_k (int): Maximum number of results to return across all documents.
+        min_score (float, optional): Minimum similarity score required for a result to be included. Defaults to 0.0.
+        workspace_id (str | None): Optional workspace ID to allow workspace-scoped access.
+    
+    Returns:
+        list[RetrievedChunk]: Retrieved chunks across the given documents, sorted by descending `score`, limited to `top_k`.
+    """
+    if not document_ids:
+        return []
+
+    placeholders = ", ".join("?" for _ in document_ids)
+    ws_id = workspace_id or ""
+
+    if settings.using_postgres:
+        params = [_vector_literal(query_embedding), owner_id, ws_id] + document_ids + [_vector_literal(query_embedding), top_k]
+        rows = await fetch_all(
+            f"""
+            SELECT c.id, c.document_id, c.content, c.page_number, c.parent_content, c.chunk_index,
+                   1 - (c.embedding <=> ?::vector) AS score
+            FROM document_chunks c
+            JOIN documents d ON c.document_id = d.id
+            WHERE (c.owner_id = ? OR d.workspace_id = ?) AND c.document_id IN ({placeholders})
+            ORDER BY c.embedding <=> ?::vector
+            LIMIT ?
+            """,
+            tuple(params),
+        )
+        return [
+            RetrievedChunk(
+                chunk_id=row["id"],
+                document_id=row["document_id"],
+                excerpt=_excerpt_from_row(row),
+                score=float(row["score"] or 0.0),
+                page_number=row.get("page_number"),
+                chunk_index=row.get("chunk_index"),
+            )
+            for row in rows
+            if float(row["score"] or 0.0) >= min_score
+        ]
+
+    params = [owner_id, ws_id] + document_ids
+    rows = await fetch_all(
+        f"""
+        SELECT c.id, c.document_id, c.content, c.page_number, c.parent_content, c.embedding_json
+        FROM document_chunks c
+        JOIN documents d ON c.document_id = d.id
+        WHERE (c.owner_id = ? OR d.workspace_id = ?) AND c.document_id IN ({placeholders})
+        """,
+        tuple(params),
+    )
+    if not rows:
+        return []
+
+    return await asyncio.to_thread(_compute_similarities_sqlite, rows, query_embedding, top_k, min_score)
+
+
+# async def query_vertex_search(document_id: str, question: str, top_k: int) -> list[RetrievedChunk]:
+#     """Query Vertex AI Search instead of local vector similarity."""
+#     from backend.services.vertex_search import search as vertex_search
+#
+#     return await asyncio.to_thread(vertex_search, question, document_id, top_k)
