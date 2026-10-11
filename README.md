@@ -20,673 +20,246 @@
 ## Table of Contents
 
 - [Overview](#overview)
+- [Key Differentiators](#key-differentiators)
 - [Features](#features)
-- [Screenshots & Demo](#screenshots--demo)
-- [Tech Stack](#tech-stack)
 - [Architecture Overview](#architecture-overview)
-- [Folder Structure](#folder-structure)
-- [Installation](#installation)
-- [Environment Variables](#environment-variables)
-- [Running Locally](#running-locally)
-- [Development Workflow](#development-workflow)
-- [API Documentation](#api-documentation)
+- [Tech Stack](#tech-stack)
+- [Quick Start](#quick-start)
+  - [Option A — Docker Compose (Recommended)](#option-a--docker-compose-recommended)
+  - [Option B — Local Development](#option-b--local-development)
+- [Essential Environment Variables](#essential-environment-variables)
+- [API Highlights & Interactive Docs](#api-highlights--interactive-docs)
 - [Database Schema](#database-schema)
-- [State Management & Data Flow](#state-management--data-flow)
-- [Authentication & Authorization](#authentication--authorization)
-- [AI / LLM Orchestration](#ai--llm-orchestration)
-- [Integrations](#integrations--external-services)
-- [Build & Deployment](#build--deployment)
-- [Docker Setup](#docker-setup)
-- [Testing](#testing)
-- [Linting & Formatting](#linting--formatting)
-- [Performance](#performance-optimizations)
-- [Security](#security-considerations)
-- [Scalability](#scalability-notes)
-- [Known Issues & Limitations](#known-issues--limitations)
-- [Roadmap Suggestions](#roadmap-suggestions)
+- [Testing & Quality Gates](#testing--quality-gates)
+- [Security & Performance](#security--performance)
 - [Contributing](#contributing)
 - [License](#license)
-- [Credits](#credits--acknowledgements)
 
 ---
 
 ## Overview
 
-### What problem it solves
+### What Problem It Solves
 
-Teams accumulate knowledge in PDFs, DOCX files, spreadsheets, and internal wikis, but generic chatbots cannot answer questions **grounded in those specific documents** without a retrieval pipeline. This platform closes that gap: it ingests files, embeds them into a vector index, retrieves relevant passages at query time, expands neighboring context windows, and generates answers that cite the exact chunks used.
+Teams accumulate mission-critical knowledge across PDFs, spreadsheets, Word documents, and technical wikis. Standard LLMs hallucinate or cannot answer without exact grounding. This platform bridges that gap: it ingests documents through a resilient background pipeline, indexes them with vector embeddings + full-text search, expands contextual boundaries, and delivers real-time streaming answers with verifiable, click-through page citations.
 
-### Why it exists
+---
 
-The repository evolved into a **split-stack enterprise product**: a modern Next.js 16 dashboard for upload/chat/notebook UX, and a FastAPI backend with a **durable background worker** for ingestion and retrieval. The design optimizes for **self-hosting** (BYOK, no mandatory SaaS), **operational visibility** (jobs, metrics, readiness), and **production RAG capabilities** (PostgreSQL 17 + pgvector, hybrid search, window expansion, multi-query routing, and multi-model support).
+## Key Differentiators
 
-### Key differentiators
-
-| Differentiator | How it shows up in code |
-|----------------|-------------------------|
-| **Multi-Provider BYOK** | Provider keys (DeepSeek, Google Gemini, OpenAI) are stored in the browser session, sent only to your backend via `X-Provider-Api-Key`, and temporarily retained in queued ingest jobs until the worker finishes. |
-| **Durable Ingestion Worker** | Upload returns `202` immediately; `backend/worker.py` polls `document_jobs` and executes extract → chunk → embed → index with automatic text/font sanitization (`backend/services/jobs.py`). |
-| **Production pgvector Engine** | PostgreSQL 17 with `pgvector` HNSW indexes and tsvector full-text search as the primary production engine via Docker Compose. |
-| **Context Window Expansion** | Generic parent-child window expansion (`backend/services/window_expansion.py`) fetches adjacent parent context (+2 forward, -1 backward) to eliminate chunk boundary loss. |
-| **Sub-Query Decomposition** | Comparative & multi-entity queries are decomposed and routed per document/scope with synthesized aggregation (`backend/routers/chat.py`). |
-| **Workspaces & RBAC** | Multi-source knowledge bases with roles (`owner` / `admin` / `editor` / `viewer`) enforced in `backend/services/workspace_rbac.py`. |
-| **Observable Pipeline** | Real-time SSE streaming answers with inline citations, retrieval stages inspection (`stages`), and optional Langfuse tracing. |
+| Differentiator | Implementation Details |
+|----------------|------------------------|
+| **Multi-Provider BYOK** | Provider keys (DeepSeek, Gemini, OpenAI) stay in browser sessions via `X-Provider-Api-Key` and are used temporarily during ingestion jobs without SaaS lock-in. |
+| **Durable Ingestion Worker** | Upload returns `202 Accepted` immediately. A dedicated background worker (`backend/worker.py`) consumes jobs with automatic font/NUL byte sanitization. |
+| **Production pgvector Engine** | PostgreSQL 17 with `pgvector` HNSW index and `tsvector` full-text search fused via Reciprocal Rank Fusion (RRF). |
+| **Context Window Expansion** | Generic parent-child expansion (+2 forward, -1 backward chunks) eliminates boundary information loss (`backend/services/window_expansion.py`). |
+| **Sub-Query Decomposition** | Complex comparative queries are broken down into sub-queries, routed per document scope, and synthesized into cohesive answers. |
+| **Multi-Tenant Workspaces & RBAC** | Organization workspaces with fine-grained role-based access control (`owner`, `admin`, `editor`, `viewer`). |
+| **Split-Pane PDF Notebook** | Real-time SSE streaming with inline bracketed citations (`[1]`, `[2]`) that jump directly to source pages in an interactive PDF viewer. |
 
 ---
 
 ## Features
 
-### Core (always available)
+### Core Capabilities
+- **Multi-LLM Support:** DeepSeek (`deepseek-chat`, `deepseek-reasoner` / R1), Google Gemini (`gemini-2.5-flash`), and OpenAI (`gpt-4o`, `gpt-4o-mini`).
+- **Comprehensive Document Parsing:** PDF, DOCX, XLSX, CSV, PPTX, TXT, Markdown, and Web URLs with checksum deduplication.
+- **Robust Ingestion Pipeline:** Automatic text/font artifact cleanup, retry queue with exponential backoff, and heartbeat health checks.
+- **Streaming Cited Chat:** Real-time Server-Sent Events (SSE) streaming answers with confidence scores and source excerpts.
+- **Analysis Modes:** `ask` (standard Q&A), `compare` (multi-document decomposition), `extract` (structured fields), and `brief` (executive summary).
+- **Notebook Experience:** Split-pane PDF viewer (`/documents/{id}/notebook`) with click-to-page navigation.
 
-- **Multi-LLM Support** — DeepSeek (`deepseek-chat`, `deepseek-reasoner` / R1), Google Gemini (`gemini-2.5-flash`), and OpenAI (`gpt-4o`, `gpt-4o-mini`).
-- **Document upload** — multipart `POST /api/ingest` with checksum deduplication per owner + provider + embedding model, supporting PDF, DOCX, TXT, and Web URLs.
-- **Robust Ingestion** — Automatic NUL byte (`\x00`) and font artifact sanitization across extraction, chunking, and database storage.
-- **Job tracking** — stages: `queued` → `extracting` → `chunking` → `embedding` → `storing` → `ready` (or `error` with retries).
-- **Grounded chat** — JSON (`POST /api/chat`) or SSE streaming (`POST /api/chat/stream`) with `Citation` objects (chunk id, score, page, excerpt).
-- **Parent Window Expansion** — Generic neighboring context expansion across document chunks for seamless answer coherence.
-- **Conversations** — persisted threads per document; export as Markdown/JSON.
-- **Analysis modes** — `ask` (default), `compare` (with query decomposition), `extract`, `brief` via `ChatRequest.mode` (`backend/models.py`).
-- **Notebook UX** — split-pane PDF viewer at `/documents/{id}/notebook` with click-through citations (`app/components/NotebookPdf.tsx`).
-- **User accounts** — email/password signup, session cookies + Bearer tokens, optional Google OAuth (`backend/routers/auth.py`).
-- **Admin analytics** — platform overview and per-workspace activity (`backend/routers/analytics.py`).
-
-### Advanced (feature-flagged)
-
-- Hybrid dense + PostgreSQL full-text search (RRF fusion)
-- Context window expansion (parent-child retrieval)
-- Cross-encoder reranking (Cohere, Jina, local BGE, or noop)
-- Semantic / parent-child chunking strategies
-- Contextual retrieval enrichment (Anthropic-style situating sentences)
-- Query transforms (HyDE, multi-query, step-back, sub-question decomposition)
-- MMR diversification, context compression, groundedness verifier
-- GraphRAG entity extraction + community summaries + graph traversal lane
-- Agentic planner–tool loop with `search_chunks`, `compare_documents`, etc.
-- Rolling conversation memory (summary + recent verbatim turns)
-- Message feedback (thumbs up/down) for active-learning signals
-
-### In progress / schema-only
-
-- **Cloud connectors** — Python classes exist (`backend/connectors/`) and DB tables (`connectors`, `connector_sync_runs`), but **no HTTP router** exposes connector CRUD yet.
-- **Share links & usage quotas** — tables exist in migration v10+ (`share_links`, `usage_records`, `workspace_quotas`); public REST endpoints are not wired.
+### Advanced RAG Techniques (Feature-Flagged)
+- **Hybrid Search:** Dense vector retrieval + PostgreSQL full-text search fused via Reciprocal Rank Fusion (RRF).
+- **Parent-Child Context Expansion:** Dynamic neighboring chunk expansion around top hits.
+- **Cross-Encoder Reranking:** Optional Cohere, Jina, or local BGE rerankers.
+- **Query Transformations:** HyDE (Hypothetical Document Embeddings), step-back prompting, and sub-question decomposition.
+- **Active Grounding & Guardrails:** Verification module to detect and mitigate hallucinations against source chunks.
 
 ---
 
-## Screenshots & Demo
+## Architecture Overview
 
-<!-- Replace placeholders with real assets when publishing -->
+The system operates as a four-process decoupled architecture in production:
 
-| View | Path | Description |
-|------|------|-------------|
-| Sign in | `/login` | Auth screen; `/` redirects here. Offers "Continue without an account" for BYOK use |
-| Dashboard | `/dashboard` | Upload, chat, workspaces, settings |
-| Notebook | `/documents/{id}/notebook` | PDF + cited chat side-by-side |
+```mermaid
+flowchart TB
+  subgraph Client["Frontend (Next.js 16)"]
+    UI["Web Dashboard & PDF Notebook<br/>(React 19 / TypeScript)"]
+  end
 
-```bash
-# Quick demo flow (requires API + worker + frontend)
-open http://localhost:3000/dashboard
-# 1. Paste OpenAI or Gemini API key in Settings
-# 2. Upload a PDF
-# 3. Wait for job status → ready
-# 4. Ask a question; open Notebook for citation jump-to-page
+  subgraph API["Backend API (FastAPI)"]
+    MW["Security & Rate Limit Middleware"]
+    R["API Routers (Chat, Ingest, Workspaces)"]
+  end
+
+  subgraph Worker["Background Engine (Python Worker)"]
+    JQ["Job Queue Consumer (document_jobs)"]
+    PIPE["Pipeline: Extract -> Chunk -> Embed -> Index"]
+  end
+
+  subgraph Storage["Data & Vector Store"]
+    PG[("PostgreSQL 17 + pgvector<br/>(HNSW Index + Full-Text Search)")]
+  end
+
+  UI -->|HTTP / SSE Stream| MW
+  MW --> R
+  R --> PG
+  JQ --> PIPE
+  PIPE --> PG
+  JQ -.->|Heartbeat /ready| PG
+```
+
+### Ingestion & Chat Execution Flow
+
+```mermaid
+sequenceDiagram
+  autonumber
+  actor User
+  participant API as FastAPI Gateway
+  participant Worker as Background Worker
+  participant DB as PostgreSQL + pgvector
+  participant LLM as LLM Provider
+
+  User->>API: Upload File (POST /api/ingest)
+  API->>DB: Record job (status = queued)
+  API-->>User: 202 Accepted {job_id}
+
+  Worker->>DB: Claim next queued job
+  Worker->>Worker: Parse text, chunk, embed
+  Worker->>DB: Store chunks with pgvector HNSW index
+  Worker->>DB: Update job (status = ready)
+
+  User->>API: Question (POST /api/chat/stream)
+  API->>DB: Hybrid Search (pgvector + FTS RRF)
+  API->>API: Expand Parent-Child Context Windows
+  API->>LLM: Stream prompt with grounded contexts
+  LLM-->>API: Stream token chunks
+  API-->>User: Real-time SSE with citations [1], [2]
 ```
 
 ---
 
 ## Tech Stack
 
-### Frontend
-
-| Package | Version | Role |
-|---------|---------|------|
-| [Next.js](https://nextjs.org) | 16.2.2 | App Router, standalone Docker output, API rewrites |
-| [React](https://react.dev) | 19.2.4 | UI runtime |
-| [TypeScript](https://www.typescriptlang.org) | 5.x | Type-safe client |
-| [Tailwind CSS](https://tailwindcss.com) | 4.x | Styling (`app/globals.css`) |
-| [Framer Motion](https://www.framer.com/motion/) | 12.x | Motion / transitions |
-| [react-pdf](https://github.com/wojtekmaj/react-pdf) | 10.x | Notebook PDF rendering |
-| [react-markdown](https://github.com/remarkjs/react-markdown) | 10.x | Assistant message rendering |
-
-### Backend
-
-| Package | Role |
-|---------|------|
-| [FastAPI](https://fastapi.tiangolo.com) | HTTP API, validation, OpenAPI |
-| [Uvicorn](https://www.uvicorn.org) | ASGI server |
-| [Pydantic Settings](https://docs.pydantic.dev/latest/concepts/pydantic_settings/) | Typed configuration (`backend/settings.py`) |
-| [OpenAI SDK](https://github.com/openai/openai-python) | Chat + embeddings |
-| [google-generativeai](https://github.com/google/generative-ai-python) | Gemini chat + embeddings |
-| [psycopg](https://www.psycopg.org) | Async PostgreSQL |
-| [aiosqlite](https://github.com/omnilib/aiosqlite) | Local SQLite fallback |
-| [pypdf](https://github.com/py-pdf/pypdf) / [python-docx](https://python-docx.readthedocs.io) | Document text extraction |
-| [sse-starlette](https://github.com/sysid/sse-starlette) | Chat streaming |
-| [orjson](https://github.com/ijl/orjson) | Fast JSON for citations + SSE |
-
-### Infrastructure
-
-| Component | Notes |
-|-----------|-------|
-| PostgreSQL 17 + [pgvector](https://github.com/pgvector/pgvector) | Production vectors + optional FTS (`content_tsv`) |
-| Docker Compose | `web`, `api`, `worker`, `postgres` |
-| GitHub Actions | Lint, build, pytest, eval workflows |
-| Langfuse (optional) | Retrieval/chat trace export |
+| Domain | Technologies |
+|--------|--------------|
+| **Frontend** | [Next.js 16](https://nextjs.org) (App Router), [React 19](https://react.dev), [TypeScript 5](https://www.typescriptlang.org), [Tailwind CSS 4](https://tailwindcss.com), [Framer Motion](https://www.framer.com/motion/), [react-pdf](https://github.com/wojtekmaj/react-pdf) |
+| **Backend** | [FastAPI](https://fastapi.tiangolo.com) 0.115, [Uvicorn](https://www.uvicorn.org), [Pydantic v2](https://docs.pydantic.dev), [psycopg 3](https://www.psycopg.org) (async), `sse-starlette`, `orjson` |
+| **Vector & DB** | [PostgreSQL 17](https://www.postgresql.org/) with [pgvector](https://github.com/pgvector/pgvector) (HNSW index + tsvector), SQLite fallback |
+| **AI & Models** | DeepSeek (V3 / R1), Google Gemini (2.5 Flash), OpenAI (GPT-4o), FastEmbed ONNX, Cohere / Jina rerankers |
+| **DevOps & Infra** | Docker, Docker Compose, GitHub Actions CI/CD, Devcontainer |
 
 ---
 
-## Architecture Overview
+## Quick Start
 
-The platform is a **four-process** architecture in production: browser → Next.js → FastAPI API → background worker → PostgreSQL (pgvector).
+### Option A — Docker Compose (Recommended)
 
-```mermaid
-flowchart TB
-  subgraph Client
-    UI[Next.js App<br/>app/dashboard]
-  end
-
-  subgraph Edge
-    NX[Next.js Rewrites<br/>next.config.ts]
-  end
-
-  subgraph API["FastAPI (backend/main.py)"]
-    MW[Middleware<br/>rate limit, request ID, CORS]
-    R[Routers<br/>ingest, chat, workspaces, ...]
-  end
-
-  subgraph Worker["Worker (backend/worker.py)"]
-    JQ[Job queue poll<br/>document_jobs]
-    PIPE[Ingest pipeline<br/>extract → chunk → embed]
-  end
-
-  subgraph Data
-    PG[(PostgreSQL + pgvector)]
-    SQL[(SQLite fallback)]
-  end
-
-  UI -->|fetch /api/*| NX
-  NX -->|proxy to BACKEND_URL| R
-  UI -.->|optional NEXT_PUBLIC_API_URL<br/>direct API origin| R
-  R --> MW
-  R --> PG
-  R --> SQL
-  JQ --> PIPE
-  PIPE --> PG
-  PIPE --> SQL
-  JQ -.->|heartbeat| PG
-```
-
-### Ingestion execution flow
-
-```mermaid
-sequenceDiagram
-  participant U as User / UI
-  participant A as API
-  participant Q as document_jobs
-  participant W as Worker
-  participant V as Vector store
-
-  U->>A: POST /api/ingest (file + provider key)
-  A->>A: validate_upload, dedupe by checksum
-  A->>Q: INSERT job (status=queued)
-  A-->>U: 202 {document_id, job_id}
-
-  loop Poll every WORKER_POLL_INTERVAL_SECONDS
-    W->>Q: claim next queued job
-    W->>W: extract_document (pypdf, docx, ...)
-    W->>W: chunk (fixed / semantic / parent-child)
-    W->>W: embed_texts (OpenAI or Gemini)
-    W->>V: replace_chunks (+ optional graph build)
-    W->>Q: status=ready, progress=1.0
-  end
-
-  U->>A: GET /api/jobs/{id}
-  A-->>U: stage, progress, terminal flag
-```
-
-### Chat / RAG execution flow
-
-```mermaid
-flowchart LR
-  Q[User question] --> Scope[Resolve documents<br/>doc / workspace / multi-doc]
-  Scope --> Branch{RETRIEVAL_AGENT_ENABLED?}
-  Branch -->|yes| Agent[Planner loop<br/>backend/services/agent.py]
-  Branch -->|no| Ret[Retrieval pipeline<br/>retrieval_pipeline.py]
-  Agent --> Tools[search_chunks, compare_documents, ...]
-  Tools --> Ret
-  Ret --> Lanes[Dense + optional FTS + graph lane + query transforms]
-  Lanes --> Fuse[RRF / rerank / MMR]
-  Fuse --> Prompt[build_rag_prompt<br/>backend/services/llm.py]
-  Prompt --> LLM[OpenAI or Gemini]
-  LLM --> Out[Answer + citations + stages]
-```
-
-**Why a separate worker?** Ingestion is CPU- and IO-heavy (parsing, embedding batches). Keeping it off the API process prevents upload/chat latency spikes and lets you scale workers independently. `/ready` explicitly checks for a **fresh worker heartbeat** in `service_heartbeats` — API-only deployments are considered not production-ready.
-
----
-
-## Folder Structure
-
-```
-Advanced-RAG-Document-Intelligence/
-├── app/                          # Next.js App Router (frontend)
-│   ├── login/                    # Auth screen (`/` redirects here)
-│   ├── dashboard/                # Main authenticated app shell
-│   ├── documents/[id]/notebook/  # Split-pane PDF + chat
-│   ├── components/               # UI: ChatArea, Sidebar, workspaces, etc.
-│   └── lib/
-│       ├── api.ts                # Typed HTTP client + SSE chat stream
-│       ├── store.tsx             # React context + localStorage/session state
-│       └── server-state.tsx      # Server-driven refresh helpers
-├── backend/
-│   ├── main.py                   # FastAPI app, middleware, router mounts
-│   ├── worker.py                 # Background job consumer entrypoint
-│   ├── settings.py               # All environment-backed configuration
-│   ├── models.py                 # Pydantic request/response contracts
-│   ├── migrations.py             # Schema v1–v15 (SQLite + Postgres DDL)
-│   ├── auth.py                   # Password hashing, sessions, superuser bootstrap
-│   ├── middleware.py             # Rate limit, request ID, security headers
-│   ├── database.py               # Connection pool, query helpers
-│   ├── routers/                  # HTTP route modules (thin controllers)
-│   ├── services/                 # Business logic: jobs, retrieval, LLM, graph, ...
-│   ├── connectors/               # Google Drive, Notion, Confluence, S3 (library)
-│   └── tests/                    # pytest suite + golden retrieval evals
-├── docs/
-│   ├── production.md             # Ops checklist
-│   └── eval/                     # Retrieval benchmark baselines + last runs
-├── legacy/                       # Original Streamlit prototype (frozen)
-├── docker-compose.yml            # Full stack: postgres, api, worker, web
-├── Dockerfile                    # Next.js standalone production image
-├── backend/Dockerfile            # Python API/worker image
-├── .env.example                  # Documented configuration template
-└── AGENTS.md                     # Contributor/agent orientation (not user docs)
-```
-
-### Important modules
-
-| File | Responsibility |
-|------|----------------|
-| `backend/services/jobs.py` | Enqueue, claim, process ingest jobs; retry with backoff |
-| `backend/services/retrieval_pipeline.py` | Dense/hybrid/rerank/MMR orchestration |
-| `backend/services/agent.py` | Provider-agnostic JSON planner loop |
-| `backend/services/agent_tools.py` | Audited tool registry (`search_chunks`, etc.) |
-| `backend/services/vectorstore.py` | pgvector / SQLite similarity queries |
-| `backend/routers/chat.py` | Chat, stream, rerun; wires retrieval + memory + grounding |
-| `app/lib/api.ts` | Frontend API surface (1300+ lines, mirrors backend contracts) |
-| `next.config.ts` | Rewrites frontend `/api/*`, `/health`, `/ready`, and `/metrics` calls to `BACKEND_URL` |
-
----
-
-## Installation
-
-### Prerequisites
-
-| Requirement | Version | Notes |
-|-------------|---------|-------|
-| Node.js | ≥ 20 (22 in CI) | `npm ci` |
-| Python | 3.12 recommended | venv for backend |
-| LLM API Key | DeepSeek / Gemini / OpenAI | BYOK per request |
-| Docker Compose | Recommended | Runs PostgreSQL 17 + pgvector on port 5433 |
-| PostgreSQL + pgvector | pg 15+ (pg17 included) | Primary production vector store |
-
-### 1. Clone and configure
+Run the entire production stack (Postgres + pgvector, API, Worker, Next.js Web) with a single command:
 
 ```bash
+# 1. Clone repository
 git clone https://github.com/khoiabc2020/Advanced-RAG-Document-Intelligence.git
 cd Advanced-RAG-Document-Intelligence
+
+# 2. Configure environment
 cp .env.example .env
-# Edit .env — at minimum set DEFAULT_SUPERUSER_PASSWORD
+
+# 3. Start all services
+docker compose up -d --build
 ```
 
-### 2. Start PostgreSQL with pgvector (Docker)
+Access the services:
+* **Web Dashboard:** [http://localhost:3000/dashboard](http://localhost:3000/dashboard)
+* **Interactive API Docs (Swagger):** [http://localhost:8000/docs](http://localhost:8000/docs)
+* **Health Check:** `http://localhost:8000/health` (Liveness) & `http://localhost:8000/ready` (Readiness)
 
+---
+
+### Option B — Local Development
+
+#### 1. Start PostgreSQL (pgvector)
 ```bash
 docker compose up -d postgres
 ```
 
-### 3. Frontend dependencies
-
+#### 2. Install & Run Frontend
 ```bash
 npm ci
+npm run dev
+# Running on http://localhost:3000
 ```
 
-### 4. Backend virtual environment
-
+#### 3. Install & Run Backend (Terminal 1)
 ```bash
 python -m venv .venv
-
-# On Linux/macOS:
-source .venv/bin/activate
+# Windows: .\.venv\Scripts\Activate.ps1 | Linux/macOS: source .venv/bin/activate
 pip install -r backend/requirements.txt
 
-# On Windows (PowerShell):
-.\.venv\Scripts\Activate.ps1
-pip install -r backend/requirements.txt
-```
-
----
-
-## Environment Variables
-
-Full template: [`.env.example`](./.env.example). Below is a reference grouped by concern.
-
-### Required
-
-| Variable | Description |
-|----------|-------------|
-| `DEFAULT_SUPERUSER_PASSWORD` | **Required.** Bootstraps/resets the admin user (`DEFAULT_SUPERUSER_EMAIL`) on API startup (`backend/auth.py`). |
-
-### Storage
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `DATABASE_URL` | `postgresql://document_rag:document_rag@localhost:5433/document_rag` | PostgreSQL DSN. Enables pgvector + hybrid FTS. |
-| `DATABASE_PATH` | `data/ragapp.db` | SQLite fallback when `DATABASE_URL` is unset. |
-
-### Frontend ↔ backend wiring
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `NEXT_PUBLIC_API_URL` | _(empty)_ | Optional browser-visible API origin. Leave empty for same-origin `/api/*` calls through Next.js rewrites; set it when the API is hosted on a separate public origin. |
-| `BACKEND_URL` | `http://127.0.0.1:8000` | Server-side target used by `next.config.ts` rewrites at build time. |
-| `CORS_ORIGINS` | localhost ports | Comma-separated origins for FastAPI CORS. |
-
-### Ingestion & retrieval tuning
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `MAX_DOCUMENT_BYTES` | `10485760` | Upload size cap (10 MiB). |
-| `CHUNK_SIZE` / `CHUNK_OVERLAP` | `1200` / `200` | Fixed chunking window. |
-| `CHUNK_STRATEGY` | `fixed` | `fixed` \| `semantic` |
-| `RAG_TOP_K` | `5` | Default retrieval count. |
-| `WORKER_POLL_INTERVAL_SECONDS` | `1.5` | Worker queue poll interval. |
-| `WORKER_HEARTBEAT_TTL_SECONDS` | `60` | Stale worker threshold for `/ready`. |
-
-### Auth
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `DEFAULT_SUPERUSER_EMAIL` | `admin@example.com` | Admin bootstrap email. |
-| `AUTH_COOKIE_NAME` | `rag_session` | HttpOnly session cookie. |
-| `AUTH_COOKIE_TTL_HOURS` | `168` | Session lifetime (7 days). |
-| `AUTH_SECURE_COOKIES` | `false` | Set `true` behind HTTPS in production. |
-| `GOOGLE_OAUTH_CLIENT_ID` / `SECRET` | empty | Optional Google sign-in. |
-
-### Feature flags (retrieval / agent / graph)
-
-See [`.env.example`](./.env.example) for the complete list. All `RETRIEVAL_*` flags default to **`false`** so production behavior matches the baseline dense pipeline unless you opt in.
-
----
-
-## Running Locally
-
-### Option A — Windows (Recommended Runners)
-
-#### Terminal 1 — API Server
-```powershell
+# Start API Server
 python run_server.py
+# Running on http://127.0.0.1:8000
 ```
 
-#### Terminal 2 — Background Ingestion Worker
-```powershell
+#### 4. Run Ingestion Worker (Terminal 2)
+```bash
 python run_worker.py
 ```
 
-#### Terminal 3 — Frontend
-```powershell
-npm run dev
-```
+---
 
-### Option B — Linux / macOS
+## Essential Environment Variables
 
-#### Terminal 1 — API
-```bash
-export DEFAULT_SUPERUSER_PASSWORD=dev-admin-secret
-.venv/bin/uvicorn backend.main:app --reload --host 127.0.0.1 --port 8000
-```
+Configure your `.env` file based on [`.env.example`](./.env.example):
 
-#### Terminal 2 — Worker
-```bash
-export DEFAULT_SUPERUSER_PASSWORD=dev-admin-secret
-.venv/bin/python -m backend.worker
-```
+| Variable | Default / Example | Purpose |
+|----------|-------------------|---------|
+| `DEFAULT_SUPERUSER_PASSWORD` | `dev-admin-secret` | **Required.** Initial admin user password (`admin@example.com`). |
+| `DATABASE_URL` | `postgresql://document_rag:document_rag@localhost:5433/document_rag` | PostgreSQL DSN for pgvector and full-text search. |
+| `BACKEND_URL` | `http://127.0.0.1:8000` | Target URL for Next.js API proxying. |
+| `MAX_DOCUMENT_BYTES` | `10485760` (10MB) | Maximum file upload size cap. |
+| `CHUNK_SIZE` / `CHUNK_OVERLAP` | `1200` / `200` | Text chunking parameters. |
+| `RAG_TOP_K` | `5` | Default number of chunks retrieved per query. |
 
-#### Terminal 3 — Frontend
-```bash
-npm run dev
-```
-
-Open **[http://localhost:3000/dashboard](http://localhost:3000/dashboard)**.
-
-| URL | Purpose |
-|-----|---------|
-| `http://localhost:3000` | Marketing site |
-| `http://localhost:3000/dashboard` | Main app |
-| `http://127.0.0.1:8000/docs` | FastAPI Swagger UI |
-| `http://127.0.0.1:8000/health` | Liveness |
-| `http://127.0.0.1:8000/ready` | Readiness (schema + worker heartbeat) |
+> Complete list of feature flags (`RETRIEVAL_HYBRID_ENABLED`, `RETRIEVAL_RERANKER_ENABLED`, etc.) is documented in [`.env.example`](./.env.example).
 
 ---
 
-## Development Workflow
+## API Highlights & Interactive Docs
 
-```mermaid
-flowchart LR
-  Dev[Edit code] --> Lint[npm run lint]
-  Dev --> Pytest[pytest backend/tests]
-  Dev --> Build[npm run build]
-  Pytest --> PR[Pull request]
-  Lint --> PR
-  Build --> PR
-  PR --> CI[GitHub Actions CI]
-```
+FastAPI provides full interactive Swagger documentation at **`http://127.0.0.1:8000/docs`**.
 
-| Task | Command |
-|------|---------|
-| Frontend dev server | `npm run dev` |
-| Production build | `npm run build` |
-| Lint | `npm run lint` |
-| Full frontend check | `npm run check` (lint + build) |
-| Backend unit tests | `npm run test:backend` or `pytest -q backend/tests` |
-| Targeted test file | `pytest -q backend/tests/test_workspaces.py` |
-| Retrieval eval (golden set) | `pytest -m eval backend/tests/eval` |
-| Compose validation | `docker compose config` |
-| Docstring gate (RAG modules) | `bash scripts/check_docstrings_rag_modules.sh` |
-
-**Agent / contributor notes:** See [`AGENTS.md`](./AGENTS.md) for code-map conventions. Do not assume ingestion works with API-only — always run the worker when testing uploads.
-
----
-
-## API Documentation
-
-Base URL: `http://127.0.0.1:8000` (or proxied via Next.js for rewritten routes).
-
-### Common headers
-
-| Header | Required | Purpose |
-|--------|----------|---------|
-| `X-Provider-Api-Key` | Ingest, reprocess, chat | BYOK for OpenAI/Gemini |
-| `X-Client-Session` | Anonymous mode | Stable id → `owner_id = anon:{session}` |
-| `Authorization: Bearer <token>` | Authenticated mode | Session from login/signup |
-| `Cookie: rag_session=...` | Browser auth | HttpOnly alternative to Bearer |
-| `X-Request-ID` | Optional | Correlation id (auto-generated if omitted) |
-
-### Error envelope
-
-```json
-{
-  "error": "Human-readable message",
-  "code": "MACHINE_CODE",
-  "request_id": "uuid",
-  "details": {}
-}
-```
-
-### Endpoint reference
-
-#### System
-
-| Method | Path | Auth | Description |
-|--------|------|------|-------------|
-| `GET` | `/health` | None | Process liveness |
-| `GET` | `/ready` | None | Schema + worker heartbeat |
-| `GET` | `/metrics` | None | Prometheus text exposition |
-
-#### Auth (`backend/routers/auth.py`)
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `POST` | `/api/auth/signup` | Create user + session |
-| `POST` | `/api/auth/login` | Email/password login |
-| `POST` | `/api/auth/logout` | Revoke session |
-| `GET` | `/api/auth/me` | Current user (authenticated) |
-| `POST` | `/api/auth/change-password` | Change password |
-| `GET` | `/api/auth/google/config` | OAuth client id |
-| `POST` | `/api/auth/google/callback` | Exchange Google code for session |
-
-#### Ingestion & documents
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `POST` | `/api/ingest` | Upload file → `202` + job |
-| `GET` | `/api/jobs/{job_id}` | Job progress |
-| `GET` | `/api/documents` | List documents (owner-scoped) |
-| `GET` | `/api/documents/{id}` | Document metadata |
-| `GET` | `/api/documents/{id}/status` | Lightweight status |
-| `GET` | `/api/documents/{id}/chunks` | Chunk preview |
-| `GET` | `/api/documents/{id}/content` | Raw extracted text |
-| `POST` | `/api/documents/{id}/reprocess` | Re-embed / retry |
-| `POST` | `/api/documents/{id}/extract` | Structured field extraction |
-| `DELETE` | `/api/documents/{id}` | Delete document + chunks |
-
-#### Chat
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `POST` | `/api/chat` | Synchronous grounded answer |
-| `POST` | `/api/chat/stream` | SSE streaming answer |
-| `POST` | `/api/chat/rerun` | Regenerate a prior assistant message |
-
-#### Conversations
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET` | `/api/conversations` | List threads |
-| `GET` | `/api/conversations/{id}` | Thread + messages |
-| `PATCH` | `/api/conversations/{id}` | Rename |
-| `GET` | `/api/conversations/{id}/export` | Markdown or JSON export |
-| `DELETE` | `/api/conversations/{id}` | Delete thread |
-
-#### Workspaces & sources (`backend/routers/workspaces.py`)
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET` | `/api/workspaces` | List (auto-creates default workspace) |
-| `POST` | `/api/workspaces` | Create workspace |
-| `GET` | `/api/workspaces/{id}` | Get workspace |
-| `PATCH` | `/api/workspaces/{id}` | Update / archive |
-| `GET` | `/api/workspaces/{id}/my-role` | Caller RBAC role |
-| `GET` | `/api/workspaces/{id}/sources` | List sources |
-| `POST` | `/api/workspaces/{id}/sources/url` | Ingest URL source |
-| `POST` | `/api/workspaces/{id}/sources/{source_id}/reprocess` | Refresh source |
-| `GET` | `/api/workspaces/{id}/sources/{source_id}/sync-runs` | URL sync history |
-| `GET/POST/PATCH/DELETE` | `/api/workspaces/{id}/members` | Member CRUD |
-| `GET/POST/DELETE` | `/api/workspaces/{id}/invitations` | Invitations |
-
-#### Artifacts (`backend/routers/artifacts.py`)
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET` | `/api/workspaces/{id}/artifacts` | List notes / saved answers |
-| `POST` | `/api/workspaces/{id}/artifacts` | Create artifact |
-| `POST` | `/api/workspaces/{id}/artifacts/from-message` | Save assistant reply |
-| `GET/PATCH/DELETE` | `/api/workspaces/{id}/artifacts/{artifact_id}` | CRUD |
-
-#### Admin & feedback
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET` | `/api/users` | List users (admin) |
-| `PATCH` | `/api/users/{id}` | Update role / active flag |
-| `GET` | `/api/analytics/overview` | Platform metrics |
-| `GET` | `/api/workspaces/{id}/analytics` | Workspace metrics |
-| `GET` | `/api/workspaces/{id}/activity` | Recent activity feed |
-| `GET` | `/api/models?provider=openai` | List chat + embedding models |
-| `POST` | `/api/feedback` | Thumbs up/down on message |
-| `GET` | `/api/feedback/summary` | Aggregate feedback |
-
-### Request / response examples
-
-#### Ingest
-
+### 1. Ingest a Document
 ```bash
 curl -X POST http://127.0.0.1:8000/api/ingest \
-  -H "X-Client-Session: demo-session-001" \
+  -H "X-Client-Session: demo-session" \
   -H "X-Provider-Api-Key: $OPENAI_API_KEY" \
   -F "provider=openai" \
   -F "embedding_model=text-embedding-3-small" \
-  -F "file=@./report.pdf"
+  -F "file=@./contract.pdf"
 ```
 
-```json
-{
-  "document_id": "8b2f4e1a-...",
-  "job_id": "c91d0a3b-...",
-  "status": "queued",
-  "embedding_model": "text-embedding-3-small",
-  "deduplicated": false
-}
-```
-
-#### Chat (workspace-scoped)
-
+### 2. Stream a Grounded Answer (SSE)
 ```bash
-curl -X POST http://127.0.0.1:8000/api/chat \
+curl -N -X POST http://127.0.0.1:8000/api/chat/stream \
   -H "Content-Type: application/json" \
-  -H "X-Client-Session: demo-session-001" \
+  -H "X-Client-Session: demo-session" \
   -H "X-Provider-Api-Key: $OPENAI_API_KEY" \
   -d '{
     "provider": "openai",
     "model": "gpt-4o-mini",
-    "workspace_id": "ws-uuid",
-    "question": "What are the main risks mentioned?",
+    "document_id": "<DOCUMENT_UUID>",
+    "question": "What are the termination conditions?",
     "mode": "ask"
   }'
-```
-
-```json
-{
-  "conversation_id": "...",
-  "message_id": "...",
-  "content": "The document highlights ...",
-  "sources": [
-    {
-      "chunk_id": "...",
-      "document_id": "...",
-      "excerpt": "...",
-      "score": 0.82,
-      "page_number": 4
-    }
-  ]
-}
-```
-
-#### Chat stream (SSE)
-
-Events emitted in order: `sources` → `token` (many) → `message_saved` → `done`. On failure: single `event: error`.
-
-```bash
-curl -N -X POST http://127.0.0.1:8000/api/chat/stream \
-  -H "Content-Type: application/json" \
-  -H "X-Client-Session: demo-session-001" \
-  -H "X-Provider-Api-Key: $OPENAI_API_KEY" \
-  -d '{"provider":"openai","model":"gpt-4o-mini","document_id":"...","question":"Summarize section 2"}'
 ```
 
 ---
 
 ## Database Schema
 
-Schema version **15** (`backend/migrations.py`). Applied automatically on API/worker startup via `require_current_schema()`.
-
-### Core entities
+Managed via automated migrations (`backend/migrations.py` Schema v15):
 
 ```mermaid
 erDiagram
@@ -699,332 +272,48 @@ erDiagram
   workspaces ||--o{ workspace_sources : lists
   workspaces ||--o{ workspace_members : grants
   workspaces ||--o{ workspace_artifacts : stores
-  documents }o--|| workspaces : optional
+  workspaces ||--o{ documents : contains
 ```
 
-| Table | Purpose |
-|-------|---------|
-| `documents` | File metadata, status, checksum dedupe, optional `workspace_id` |
-| `document_jobs` | Durable queue; stores `provider_api_key` until job completes |
-| `document_chunks` | Text + embeddings (pgvector column or `embedding_json` in SQLite) |
-| `conversations` / `messages` | Chat history; `sources_json` on assistant messages |
-| `users` / `auth_sessions` | Credentials + session tokens (hashed) |
-| `workspaces` / `workspace_members` | Multi-tenant knowledge bases + RBAC |
-| `workspace_sources` | Unified file / URL / note sources per workspace |
-| `workspace_artifacts` | Saved notes, briefs, extraction results |
-| `feedback` | Per-message ratings (Phase 3.8) |
-| `conversation_memory` | Rolling summaries (Phase 3.7) |
-| `graph_entities` / `graph_relations` / `graph_communities` | GraphRAG (optional ingest) |
-| `connectors` / `connector_sync_runs` | Future external sync (schema present) |
-| `share_links` / `usage_records` / `workspace_quotas` | Future sharing & metering |
+* **`documents` & `document_chunks`:** Store raw metadata, chunk texts, and HNSW vector embeddings.
+* **`document_jobs`:** Durable queue tracking asynchronous extraction, chunking, and embedding stages.
+* **`conversations` & `messages`:** Persisted chat history with structured citations (`chunk_id`, `score`, `page`).
+* **`workspaces` & `workspace_members`:** Multi-tenant access boundaries with RBAC enforcement.
 
 ---
 
-## State Management & Data Flow
-
-### Frontend (`app/lib/store.tsx`)
-
-- **React Context + useReducer** — no Redux; single `StoreProvider` wraps the dashboard.
-- **Persistence split:**
-  - `localStorage` (`rag-prefs`) — theme, provider choice, top-k (non-secret).
-  - `sessionStorage` (`rag-session`) — `providerApiKey`, `clientSessionId`, `authToken`.
-- **Workspace state** — `workspaces`, `activeWorkspaceId` loaded via `listWorkspaces()` on auth.
-- **Server state** — `ServerStateProvider` coordinates polling for documents/jobs.
-
-### Scoping model
-
-```
-owner_id = "user:{uuid}"     # authenticated
-owner_id = "anon:{session}"  # anonymous + X-Client-Session
-```
-
-All documents, jobs, conversations, and chunks are filtered by `owner_id`. Workspace membership adds a second authorization layer via RBAC.
-
-### Next.js API routing
-
-`next.config.ts` rewrites the app's backend-facing routes (`/api/auth`, chat, ingest, documents, jobs, conversations, users, analytics, models, workspaces, feedback) plus `/health`, `/ready`, and `/metrics` to `BACKEND_URL`. When `NEXT_PUBLIC_API_URL` is empty, `app/lib/api.ts` uses those same-origin paths. Set `NEXT_PUBLIC_API_URL` only when browsers should call a separate public API origin directly.
-
-### Streaming UI state
-
-The chat UI treats every in-flight stream as a generation and applies SSE callbacks to a specific assistant message id. Late callbacks from a stopped stream are ignored, partial output is kept on abort, and conversation refresh errors are surfaced without deleting completed answers. Autoscroll follows only while the user is near the bottom, so long answers do not scroll-jack readers.
-
----
-
-## Authentication & Authorization
-
-### Authentication flow
-
-```mermaid
-sequenceDiagram
-  participant B as Browser
-  participant A as API
-  participant DB as Database
-
-  alt Email/password
-    B->>A: POST /api/auth/login
-    A->>DB: verify PBKDF2 hash
-    A->>DB: INSERT auth_sessions
-    A-->>B: Set-Cookie rag_session + session_token JSON
-  else Anonymous BYOK
-    B->>A: X-Client-Session + X-Provider-Api-Key
-    A-->>B: owner_id = anon:session
-  end
-
-  B->>A: POST /api/chat (cookie or Bearer)
-  A->>A: get_request_context()
-```
-
-### Authorization layers
-
-1. **Request context** (`backend/routers/deps.py`) — resolves `owner_id` from session or client session header.
-2. **Provider key** — `require_provider_api_key` on LLM-touching routes.
-3. **Workspace RBAC** (`backend/services/workspace_rbac.py`) — role hierarchy: `viewer` < `editor` < `admin` < `owner`.
-4. **Platform admin** — `role == "admin"` for `/api/users` and analytics.
-
-On startup, `ensure_default_superuser()` resets the admin password hash from `DEFAULT_SUPERUSER_PASSWORD` — intentional for appliances, but **rotate immediately** in production.
-
----
-
-## AI / LLM Orchestration
-
-### Model providers
-
-| Provider | Ingest / embed | Chat | Notes |
-|----------|----------------|------|-------|
-| `openai` | ✅ | ✅ | Default models in `settings.py` |
-| `gemini` | ✅ | ✅ | Google Generative AI SDK |
-| `vertex_search` | ✅ (ingest) | — | Uses Google Cloud Discovery Engine; service credentials |
-
-### Retrieval pipeline (`backend/services/retrieval_pipeline.py`)
-
-Stateless orchestrator:
-
-1. Embed query (`embed_query`)
-2. Dense vector search (`query_similar` / `query_similar_multi`)
-3. Optional FTS lane + RRF (`hybrid.py`) — Postgres only
-4. Optional rerank (`reranker.py`)
-5. Optional MMR diversification (`mmr.py`)
-6. Return `RetrievalResult` with `stages` metadata
-
-### Agentic mode (`RETRIEVAL_AGENT_ENABLED=true`)
-
-The planner in `backend/services/agent.py` uses **JSON envelopes** (not native tool-calling APIs) for provider portability:
-
-```json
-{"action": "call_tool", "tool": "search_chunks", "args": {"query": "..."}, "thought": "..."}
-{"action": "answer", "thought": "..."}
-{"action": "abstain", "reason": "..."}
-```
-
-Tools (`backend/services/agent_tools.py`): `search_chunks`, `get_document_summary`, `list_documents`, `compare_documents`.
-
-Hard caps: `RETRIEVAL_AGENT_MAX_ITERATIONS`, `RETRIEVAL_AGENT_MAX_CHUNKS`, `RETRIEVAL_AGENT_MAX_TOOL_CALLS`.
-
-### Memory (`MEMORY_ENABLED=true`)
-
-`backend/services/memory.py` maintains:
-
-- Verbatim **recent** turns (`MEMORY_RECENT_TURNS`)
-- LLM-updated **summary** of older turns in `conversation_memory`
-
-Fails open — summarization errors fall back to last-N history.
-
-### Prompting
-
-`build_rag_prompt` in `backend/services/llm.py` injects retrieved chunks with citation instructions. Analysis modes (`compare`, `extract`, `brief`) swap system instructions without changing the citation contract.
-
-### Tracing
-
-When `LANGFUSE_PUBLIC_KEY` and `LANGFUSE_SECRET_KEY` are set, spans wrap retrieval, agent iterations, and chat generation (`backend/services/tracing.py`). Otherwise zero overhead no-op.
-
----
-
-## Integrations & External Services
-
-| Integration | Status | Location |
-|-------------|--------|----------|
-| OpenAI API | Production | `backend/services/llm.py`, `embeddings.py` |
-| Google Gemini | Production | same |
-| Vertex AI Search | Partial | `backend/services/vertex_search.py`; ingest path in routers |
-| Google OAuth | Optional | `backend/routers/auth.py` |
-| Langfuse | Optional | `backend/services/tracing.py` |
-| Google Drive / Notion / Confluence / S3 | Library only | `backend/connectors/` — no REST management API yet |
-| Cohere / Jina rerankers | Optional | `backend/services/reranker.py` when `RETRIEVAL_RERANKER_ENABLED=true` |
-
----
-
-## Build & Deployment
-
-### npm scripts
-
-| Script | Description |
-|--------|-------------|
-| `npm run dev` | Next.js development server (port 3000) |
-| `npm run build` | Production build (standalone output) |
-| `npm run start` | Run production server |
-| `npm run lint` | ESLint |
-| `npm run check` | `lint` + `build` |
-| `npm run test:backend` | `pytest -q backend/tests` |
-
-### Production topology
-
-Recommended ([`docs/production.md`](./docs/production.md)):
-
-| Service | Exposure | Notes |
-|---------|----------|-------|
-| `web` | Public (reverse proxy) | Next.js standalone |
-| `api` | Internal or proxied | FastAPI |
-| `worker` | None | Always-on; ≥1 replica |
-| `postgres` | Private | Persistent volume |
-
-### Heroku-style Procfile
-
-```
-web: uvicorn backend.main:app --host 0.0.0.0 --port $PORT
-worker: python -m backend.worker
-```
-
-### Reverse proxy
-
-Proxy browser traffic to `web`. The default Next.js rewrites forward app API calls and `/health`, `/ready`, `/metrics` to `BACKEND_URL`. If the API is exposed on a different browser-visible origin instead, set `NEXT_PUBLIC_API_URL` to that origin and configure `CORS_ORIGINS` accordingly.
-
----
-
-## Docker Setup
+## Testing & Quality Gates
 
 ```bash
-docker compose up --build
+# Run backend test suite
+pytest -q backend/tests
+
+# Run retrieval quality benchmark against golden set
+pytest -m eval backend/tests/eval
+
+# Validate frontend types and ESLint
+npm run check
 ```
 
-| Service | Port | Image |
-|---------|------|-------|
-| `postgres` | 5432 | `pgvector/pgvector:pg17` |
-| `api` | 8000 | `backend/Dockerfile` |
-| `worker` | — | same image, `python -m backend.worker` |
-| `web` | 3000 | root `Dockerfile` (Next standalone) |
-
-Compose sets `DATABASE_URL` for all Python services and `BACKEND_URL` for the web container. If you intentionally expose the API separately from the web origin, set `NEXT_PUBLIC_API_URL` for the `web` service as well.
-
-### Backup
-
-```bash
-docker compose exec postgres pg_dump -U document_rag document_rag > backup.sql
-cat backup.sql | docker compose exec -T postgres psql -U document_rag -d document_rag
-```
+Automated GitHub Actions workflows run CI tests, linting, and scheduled retrieval evals on every commit.
 
 ---
 
-## Testing
+## Security & Performance
 
-| Suite | Command | Purpose |
-|-------|---------|---------|
-| Unit + integration | `pytest -q backend/tests` | Routers, RBAC, jobs, retrieval |
-| Eval / golden | `pytest -m eval backend/tests/eval` | Retrieval quality regression |
-| Frontend | `npm run lint && npm run build` | Types + ESLint |
-| Compose | `docker compose config` | Validate orchestration |
-| Nightly eval | [`.github/workflows/nightly-eval.yml`](./.github/workflows/nightly-eval.yml) | Scheduled retrieval benchmarks |
-
-CI runs on push/PR to `main` ([`.github/workflows/ci.yml`](./.github/workflows/ci.yml)).
-
----
-
-## Linting & Formatting
-
-- **Frontend:** ESLint 9 + `eslint-config-next` — `npm run lint`
-- **Backend:** no enforced formatter in CI; follow existing module style
-- **Docstrings:** `scripts/check_docstrings_rag_modules.sh` enforces coverage on RAG pipeline modules
-
----
-
-## Performance Optimizations
-
-- **orjson** for citation parsing and SSE payloads in hot paths (`backend/routers/chat.py`)
-- **Pre-compiled Pydantic TypeAdapter** for `list[Citation]` deserialization
-- **HNSW pgvector index** (tunable via `PGVECTOR_HNSW_*`) with IVFFlat fallback on older pgvector
-- **Checksum deduplication** skips re-embedding identical files per owner
-- **Over-fetch + rerank** only when `RETRIEVAL_RERANKER_ENABLED=true`
-- **Standalone Next.js output** — minimal production Node image (`Dockerfile`)
-- **IP-based rate limiting** in middleware (not per random auth header) to prevent bypass
-
----
-
-## Security Considerations
-
-- **BYOK** — provider keys are stored in `sessionStorage["rag-session"]` in the browser, sent to your backend as `X-Provider-Api-Key` for LLM/ingest requests, and temporarily held in `document_jobs.provider_api_key` while queued worker jobs run. Treat browser sessions, API logs, and the database as sensitive.
-- **Password storage** — PBKDF2-SHA256 with 480k iterations (`backend/auth.py`).
-- **Session tokens** — stored hashed in `auth_sessions`; HttpOnly cookies in browser mode.
-- **Owner scoping** — every query includes `owner_id`; agent tools cannot escape document allow-lists.
-- **Rate limiting** — per-IP RPM (`RATE_LIMIT_RPM`) persisted in `rate_limit_windows`.
-- **Security headers** — `SecurityHeadersMiddleware` on all API responses.
-- **Upload validation** — extension allow-list + size cap (`validate_upload` in `backend/services/extract.py`).
-- **Production checklist:** set `AUTH_SECURE_COOKIES=true`, strong `DEFAULT_SUPERUSER_PASSWORD`, restrict `CORS_ORIGINS`, run Postgres on a private network, terminate TLS at the proxy.
-
----
-
-## Scalability Notes
-
-- **Horizontal scaling:** run multiple `worker` replicas; job claiming uses atomic `UPDATE ... WHERE status='queued'` to avoid double processing.
-- **API replicas:** stateless except DB connection pool; ensure shared Postgres.
-- **Readiness gate:** load balancers should use `/ready`, not `/health`, so traffic only hits clusters with a live worker.
-- **Vector index:** tune HNSW parameters for recall/latency tradeoffs on large corpora.
-- **Feature flags:** enable hybrid/agent/graph incrementally per environment without code changes.
-
----
-
-## Known Issues & Limitations
-
-| Limitation | Detail |
-|------------|--------|
-| **Worker required** | Upload/chat over indexed docs fails without `backend.worker` running. |
-| **SQLite dev fallback** | No hybrid FTS, reduced vector performance; not recommended for production. |
-| **Connectors** | Python + DB schema exist; no public connector REST API yet. |
-| **Usage / share APIs** | Tables migrated; HTTP endpoints not implemented. |
-| **Vertex Search** | Partially integrated; main path uses OpenAI/Gemini embeddings. |
-| **Provider keys in job rows** | Queued jobs store `provider_api_key` until completion — treat DB as sensitive. |
-| **Superuser password reset** | Every API start resets admin password from env — surprising if unintended. |
-
----
-
-## Roadmap Suggestions
-
-- Expose connector CRUD + scheduled sync HTTP API atop `backend/connectors/`
-- Wire `share_links` and `usage_records` to UI + enforcement middleware
-- Optional OIDC / SSO beyond Google OAuth
-- Document-level access ACLs within shared workspaces
-- OCR / layout-aware extraction (evaluate Docling integration)
-- Helm chart or Terraform module for cloud deployment
+- **BYOK (Bring Your Own Key):** API keys stay client-side in browser session storage and are only used ephemerally during requests.
+- **Authentication:** PBKDF2-SHA256 (480k iterations) password hashing with secure HttpOnly cookies.
+- **Performance:** `orjson` serialization on SSE streams, HNSW vector indexing for sub-millisecond nearest neighbor search, and SHA-256 deduplication to prevent duplicate embeddings.
+- **Tenant Isolation:** All database queries are strictly scoped by `owner_id` and workspace RBAC policies.
 
 ---
 
 ## Contributing
 
-Contributions are welcome — bug reports, fixes, features, and docs improvements. See [CONTRIBUTING.md](CONTRIBUTING.md) for the full workflow and [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) for community expectations. To report a security issue privately, see [SECURITY.md](SECURITY.md).
-
-Quick checklist:
-
-1. Fork and create a feature branch.
-2. Run targeted tests first, then `pytest -q backend/tests` for cross-cutting changes.
-3. For UI changes: `npm run lint` and manual browser verification.
-4. For retrieval changes: run eval suite and compare `docs/eval/last_run.json` to baseline.
-5. Keep `legacy/` untouched unless the task explicitly targets it.
-6. Open a PR with a clear test plan.
+Contributions are welcome! Please check out [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines, [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) for community standards, and [SECURITY.md](SECURITY.md) to report vulnerabilities.
 
 ---
 
 ## License
 
-[Apache License 2.0](LICENSE)
-
----
-
-## Credits & Acknowledgements
-
-- Built with [FastAPI](https://fastapi.tiangolo.com), [Next.js](https://nextjs.org), and [pgvector](https://github.com/pgvector/pgvector).
-- RAG techniques inspired by industry patterns (hybrid search, contextual retrieval, GraphRAG, agentic RAG) implemented as optional, flag-gated modules.
-- Original Streamlit prototype preserved under `legacy/` for reference.
-
----
-
-<p align="center">
-  <strong>Questions or production help?</strong> See <a href="./docs/production.md">docs/production.md</a> and <a href="./AGENTS.md">AGENTS.md</a> for operator and contributor guides.
-</p>
+Distributed under the [Apache License 2.0](LICENSE).
